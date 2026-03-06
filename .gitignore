@@ -7,4 +7,5 @@ __pycache__/
 dist/
 build/
 sp500_backtest/checkpoint/*.json
+sp500_backtest/checkpoint/*.pkl
 sp500_backtest/output/

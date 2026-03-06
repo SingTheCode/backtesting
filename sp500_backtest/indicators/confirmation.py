@@ -554,8 +554,9 @@ class HalfTrendConfirmation(ConfirmationIndicator):
 class DonchianTrendRibbonConfirmation(ConfirmationIndicator):
     """Donchian Trend Ribbon 확인 지표.
 
-    5개 기간의 Donchian 채널 중간값 대비 종가 위치를 합산하여
-    trend_sum > 0이면 Long, trend_sum < 0이면 Short 상태를 반환한다.
+    Pine Script dchannel(len) 브레이크아웃 로직:
+    close > highest(high, len)[1] → trend=1, close < lowest(low, len)[1] → trend=-1.
+    trend == 1이면 Long, trend == -1이면 Short 상태를 반환한다.
     """
 
     @property
@@ -578,13 +579,18 @@ class DonchianTrendRibbonConfirmation(ConfirmationIndicator):
     ) -> IndicatorResult:
         """Donchian Trend Ribbon 확인 시그널을 계산한다.
 
+        Pine Script dchannel(len) 로직:
+            hh = highest(high, len)
+            ll = lowest(low, len)
+            trend := close > hh[1] ? 1 : close < ll[1] ? -1 : nz(trend[1])
+
         Args:
             df: OHLCV DataFrame.
             params: 병합된 최종 파라미터.
             subtype: 사용하지 않음 (서브타입 없음).
 
         Returns:
-            IndicatorResult: trend_sum > 0이면 Long 상태.
+            IndicatorResult: trend == 1이면 Long, trend == -1이면 Short.
         """
         period = int(params["period"])  # Donchian 채널 기간
 
@@ -592,23 +598,28 @@ class DonchianTrendRibbonConfirmation(ConfirmationIndicator):
         high = df["High"]  # 고가
         low = df["Low"]  # 저가
 
-        # 5개 기간의 Donchian 채널 중간값 계산
-        dch_periods = [period, period * 2, period * 3, period * 4, period * 5]  # 5개 기간
-        trend_sum = pd.Series(0.0, index=df.index)  # 트렌드 합산
+        # Donchian 채널 최고가/최저가
+        hh = high.rolling(window=period, min_periods=period).max()
+        ll = low.rolling(window=period, min_periods=period).min()
 
-        for dp in dch_periods:
-            upper = high.rolling(window=dp, min_periods=dp).max()  # 기간 최고가
-            lower = low.rolling(window=dp, min_periods=dp).min()  # 기간 최저가
-            mid = (upper + lower) / 2.0  # 중간값
-            # 종가가 중간값 위면 +1, 아래면 -1
-            trend_sum = trend_sum + pd.Series(
-                np.where(close > mid, 1.0, np.where(close < mid, -1.0, 0.0)),
-                index=df.index,
-            )
+        # 상태 기반 trend 계산 (이전 trend 값 유지)
+        n = len(df)
+        trend_arr = np.zeros(n)  # trend 초기값 0
+        for i in range(1, n):
+            prev_hh = hh.iloc[i - 1]  # hh[1] — 이전 봉의 최고가
+            prev_ll = ll.iloc[i - 1]  # ll[1] — 이전 봉의 최저가
 
-        # 상태 기반 시그널 (크로스오버가 아닌 지속 상태)
-        long_signal = trend_sum > 0  # 상승 트렌드 상태
-        short_signal = trend_sum < 0  # 하락 트렌드 상태
+            if not np.isnan(prev_hh) and close.iloc[i] > prev_hh:
+                trend_arr[i] = 1  # 상승 브레이크아웃
+            elif not np.isnan(prev_ll) and close.iloc[i] < prev_ll:
+                trend_arr[i] = -1  # 하락 브레이크아웃
+            else:
+                trend_arr[i] = trend_arr[i - 1]  # 이전 trend 유지
+
+        trend = pd.Series(trend_arr, index=df.index)
+
+        long_signal = trend == 1  # 상승 트렌드 상태
+        short_signal = trend == -1  # 하락 트렌드 상태
 
         return IndicatorResult(
             long_signal=long_signal.fillna(False),
@@ -855,9 +866,9 @@ class TSIConfirmation(ConfirmationIndicator):
         active_subtype = subtype or "Signal Cross"  # 기본 서브타입
 
         if active_subtype == "Zero line cross":
-            # TSI > 0 → Long, TSI < 0 → Short (상태 기반)
-            long_signal = tsi > 0
-            short_signal = tsi < 0
+            # Pine Script: TSI > signal AND TSI > 0 → Long, TSI < signal AND TSI < 0 → Short
+            long_signal = (tsi > signal_line) & (tsi > 0)
+            short_signal = (tsi < signal_line) & (tsi < 0)
         else:
             # Signal Cross: TSI > signal → Long, TSI < signal → Short (상태 기반)
             long_signal = tsi > signal_line
@@ -869,13 +880,49 @@ class TSIConfirmation(ConfirmationIndicator):
         )
 
 
+def _t3(
+    src: pd.Series,  # T3를 계산할 원본 시계열
+    length: int,  # EMA 기간
+) -> pd.Series:  # T3 이동평균 결과
+    """T3 이동평균 계산 (Tillson T3).
+
+    Pine Script의 t3() 함수와 동일한 구현.
+    6중 EMA를 사용하여 부드러운 이동평균을 생성한다.
+    b=0.7 고정 계수를 사용한다.
+
+    Args:
+        src: 원본 시계열 데이터.
+        length: EMA 기간.
+
+    Returns:
+        T3 이동평균 pd.Series.
+    """
+    b = 0.7  # T3 계수 (Pine Script 고정값)
+
+    # 6중 EMA 체인
+    e1 = ma(src, length, "EMA")  # 1차 EMA
+    e2 = ma(e1, length, "EMA")  # 2차 EMA
+    e3 = ma(e2, length, "EMA")  # 3차 EMA
+    e4 = ma(e3, length, "EMA")  # 4차 EMA
+    e5 = ma(e4, length, "EMA")  # 5차 EMA
+    e6 = ma(e5, length, "EMA")  # 6차 EMA
+
+    # T3 계수 계산
+    c1 = -(b ** 3)  # -b³
+    c2 = 3 * b ** 2 + 3 * b ** 3  # 3b² + 3b³
+    c3 = -6 * b ** 2 - 3 * b - 3 * b ** 3  # -6b² - 3b - 3b³
+    c4 = 1 + 3 * b + b ** 3 + 3 * b ** 2  # 1 + 3b + b³ + 3b²
+
+    return c1 * e6 + c2 * e5 + c3 * e4 + c4 * e3  # T3 가중 합산
+
+
 class BXtrenderConfirmation(ConfirmationIndicator):
     """B-Xtrender 확인 지표.
 
-    단기/장기 오실레이터 값의 부호로 상태를 판단한다.
+    RSI + T3 이동평균 기반으로 단기/장기 추세 방향을 판단한다.
     서브타입:
-    - Short term: short_val > 0 → Long, short_val < 0 → Short
-    - Short and Long term: 둘 다 양수 → Long, 둘 다 음수 → Short
+    - Short Term trend: maShortTermXtrender의 방향(> [1]) → Long/Short
+    - Short and Long term trend: 단기 + 장기 추세 방향 및 레벨 동시 확인
     """
 
     @property
@@ -887,15 +934,17 @@ class BXtrenderConfirmation(ConfirmationIndicator):
     def default_params(self) -> dict:
         """Pine Script 기본 파라미터."""
         return {
-            "short_l1": 5,  # 단기 RSI 기간
-            "short_l2": 20,  # 단기 Stochastic 기간
-            "short_l3": 15,  # 장기 RSI 기간
+            "short_l1": 5,  # 단기 EMA 기간 1
+            "short_l2": 20,  # 단기 EMA 기간 2
+            "short_l3": 15,  # 단기 RSI 기간
+            "long_l1": 5,  # 장기 EMA 기간
+            "long_l2": 10,  # 장기 RSI 기간
         }
 
     @property
     def subtypes(self) -> list[str]:
         """지원하는 서브타입 목록."""
-        return ["Short term", "Short and Long term"]
+        return ["Short Term trend", "Short and Long term trend"]
 
     def _calculate_impl(
         self,
@@ -905,41 +954,58 @@ class BXtrenderConfirmation(ConfirmationIndicator):
     ) -> IndicatorResult:
         """B-Xtrender 확인 시그널을 계산한다.
 
-        short_val = RSI(short_l1) - 50 기반 Stochastic 변환
-        long_val = RSI(short_l3) - 50 기반 값
+        Pine Script 공식:
+        shortTermXtrender = rsi(ema(close, short_l1) - ema(close, short_l2), short_l3) - 50
+        maShortTermXtrender = t3(shortTermXtrender, 5)
+        longTermXtrender = rsi(ema(close, long_l1), long_l2) - 50
 
         Args:
             df: OHLCV DataFrame.
             params: 병합된 최종 파라미터.
-            subtype: "Short term" 또는 "Short and Long term".
+            subtype: "Short Term trend" 또는 "Short and Long term trend".
 
         Returns:
             IndicatorResult: 서브타입에 따른 Long/Short 상태.
         """
-        short_l1 = int(params["short_l1"])  # 단기 RSI 기간
-        short_l2 = int(params["short_l2"])  # 단기 Stochastic 기간
-        short_l3 = int(params["short_l3"])  # 장기 RSI 기간
+        short_l1 = int(params["short_l1"])  # 단기 EMA 기간 1
+        short_l2 = int(params["short_l2"])  # 단기 EMA 기간 2
+        short_l3 = int(params["short_l3"])  # 단기 RSI 기간
+        long_l1 = int(params["long_l1"])  # 장기 EMA 기간
+        long_l2 = int(params["long_l2"])  # 장기 RSI 기간
         close = df["Close"]  # 종가
 
-        # 단기 값: RSI 기반 Stochastic 변환
-        rsi_short = rsi_func(close, short_l1)  # 단기 RSI
-        stoch_rsi = stoch_func(rsi_short, rsi_short, rsi_short, short_l2)  # RSI의 Stochastic
-        short_val = ma(stoch_rsi, 3, "SMA") - 50  # SMA 평활 후 50 차감
+        # 단기 Xtrender: RSI(EMA차이, short_l3) - 50
+        ema_diff = ma(close, short_l1, "EMA") - ma(close, short_l2, "EMA")  # EMA 차이
+        short_term_xtrender = rsi_func(ema_diff, short_l3) - 50  # RSI 변환 후 50 차감
 
-        # 장기 값: RSI - 50
-        rsi_long = rsi_func(close, short_l3)  # 장기 RSI
-        long_val = ma(rsi_long, 3, "SMA") - 50  # SMA 평활 후 50 차감
+        # T3 이동평균 (b=0.7)
+        ma_short_term_xtrender = _t3(short_term_xtrender, 5)  # T3 평활화
 
-        active_subtype = subtype or "Short term"  # 기본 서브타입
+        active_subtype = subtype or "Short Term trend"  # 기본 서브타입
 
-        if active_subtype == "Short and Long term":
-            # 단기 + 장기 모두 양수 → Long, 모두 음수 → Short
-            long_signal = (short_val > 0) & (long_val > 0)
-            short_signal = (short_val < 0) & (long_val < 0)
+        if active_subtype == "Short and Long term trend":
+            # 장기 Xtrender: RSI(EMA(close, long_l1), long_l2) - 50
+            long_term_xtrender = rsi_func(ma(close, long_l1, "EMA"), long_l2) - 50
+
+            # 5개 조건 동시 충족: 단기 T3 방향 + 장기 레벨/방향 + 단기 레벨/방향
+            long_signal = (
+                (ma_short_term_xtrender > ma_short_term_xtrender.shift(1))  # T3 상승
+                & (long_term_xtrender > 0)  # 장기 양수
+                & (long_term_xtrender > long_term_xtrender.shift(1))  # 장기 상승
+                & (short_term_xtrender > short_term_xtrender.shift(1))  # 단기 상승
+                & (short_term_xtrender > 0)  # 단기 양수
+            )
+            short_signal = (
+                (ma_short_term_xtrender < ma_short_term_xtrender.shift(1))  # T3 하락
+                & (long_term_xtrender < 0)  # 장기 음수
+                & (long_term_xtrender < long_term_xtrender.shift(1))  # 장기 하락
+                & (short_term_xtrender < short_term_xtrender.shift(1))  # 단기 하락
+                & (short_term_xtrender < 0)  # 단기 음수
+            )
         else:
-            # Short term: 단기 값만 사용
-            long_signal = short_val > 0
-            short_signal = short_val < 0
+            # Short Term trend: T3 방향만 사용
+            long_signal = ma_short_term_xtrender > ma_short_term_xtrender.shift(1)
+            short_signal = ma_short_term_xtrender < ma_short_term_xtrender.shift(1)
 
         return IndicatorResult(
             long_signal=long_signal.fillna(False),
@@ -982,8 +1048,15 @@ class BullBearPowerTrendConfirmation(ConfirmationIndicator):
     ) -> IndicatorResult:
         """Bull Bear Power 확인 시그널을 계산한다.
 
-        Bull Power = High - EMA(Close, period)
-        Bear Power = Low - EMA(Close, period)
+        Pine Script 공식:
+        BullTrend = (close - lowest(low, 50)) / ATR(5)
+        BearTrend = (highest(high, 50) - close) / ATR(5)
+        BearTrend2 = -1 * BearTrend
+        Trend = BullTrend - BearTrend
+
+        히스토그램:
+        BullTrend_hist = BullTrend - 2 (BullTrend < 2일 때), 아니면 0
+        BearTrend_hist = BearTrend2 + 2 (BearTrend2 > -2일 때), 아니면 0
 
         Args:
             df: OHLCV DataFrame.
@@ -993,26 +1066,49 @@ class BullBearPowerTrendConfirmation(ConfirmationIndicator):
         Returns:
             IndicatorResult: 서브타입에 따른 Long/Short 상태.
         """
-        period = int(params["period"])  # EMA 기간
+        period = int(params["period"])  # 룩백 기간 (기본 50)
+        atr_period = int(params["atr"])  # ATR 기간 (기본 5)
         close = df["Close"]  # 종가
         high = df["High"]  # 고가
         low = df["Low"]  # 저가
 
-        ema_val = ma(close, period, "EMA")  # 기준 EMA
+        # Pine Script: ta.lowest(low, 50), ta.highest(high, 50)
+        lowest_low = low.rolling(window=period, min_periods=period).min()  # 기간 내 최저가
+        highest_high = high.rolling(window=period, min_periods=period).max()  # 기간 내 최고가
 
-        bull_power = high - ema_val  # Bull Power (고가 - EMA)
-        bear_power = low - ema_val  # Bear Power (저가 - EMA)
+        # ATR 계산 (0 나누기 방지)
+        atr_val = atr(df, atr_period)  # ATR(5)
+        atr_safe = atr_val.replace(0, np.nan)  # 0을 NaN으로 대체
+
+        # Pine Script 정규화 공식
+        bull_trend = (close - lowest_low) / atr_safe  # BullTrend
+        bear_trend = (highest_high - close) / atr_safe  # BearTrend
+        bear_trend2 = -1 * bear_trend  # BearTrend2 = -1 * BearTrend
+        trend = bull_trend - bear_trend  # Trend = BullTrend - BearTrend
+
+        # 히스토그램 계산 (Pine Script: 초기값 0.0, 조건부 갱신)
+        bull_trend_hist = pd.Series(0.0, index=df.index)  # BullTrend_hist 초기값 0
+        bear_trend_hist = pd.Series(0.0, index=df.index)  # BearTrend_hist 초기값 0
+
+        # BullTrend < 2 → BullTrend_hist = BullTrend - 2
+        mask_bull = bull_trend < 2
+        bull_trend_hist[mask_bull] = bull_trend[mask_bull] - 2
+
+        # BearTrend2 > -2 → BearTrend_hist = BearTrend2 + 2
+        mask_bear = bear_trend2 > -2
+        bear_trend_hist[mask_bear] = bear_trend2[mask_bear] + 2
 
         active_subtype = subtype or "Follow Trend"  # 기본 서브타입
 
         if active_subtype == "Without Trend":
-            # 트렌드 무시: bull > bear → Long, bear > bull → Short
-            long_signal = bull_power > bear_power
-            short_signal = bear_power > bull_power
+            # Without Trend: BearTrend_hist > 0 → Long, BullTrend_hist < 0 → Short
+            long_signal = bear_trend_hist > 0
+            short_signal = bull_trend_hist < 0
         else:
-            # Follow Trend: 둘 다 양수 → Long, 둘 다 음수 → Short
-            long_signal = (bull_power > 0) & (bear_power > 0)
-            short_signal = (bull_power < 0) & (bear_power < 0)
+            # Follow Trend: BearTrend_hist > 0 AND Trend >= 2 → Long
+            long_signal = (bear_trend_hist > 0) & (trend >= 2)
+            # Follow Trend: BullTrend_hist < 0 AND Trend <= -2 → Short
+            short_signal = (bull_trend_hist < 0) & (trend <= -2)
 
         return IndicatorResult(
             long_signal=long_signal.fillna(False),
@@ -1220,6 +1316,7 @@ class RSIConfirmation(ConfirmationIndicator):
         return {
             "length": 14,  # RSI 기간
             "ma_length": 14,  # RSI MA 기간
+            "level": 50,  # RSI 레벨 (Pine Script: respectrsilevel=50)
         }
 
     @property
@@ -1283,9 +1380,10 @@ class RSIConfirmation(ConfirmationIndicator):
             long_signal = pd.Series(long_arr, index=close.index)
             short_signal = pd.Series(short_arr, index=close.index)
         elif active_subtype == "RSI Level":
-            # RSI > 50 → Long, RSI < 50 → Short (상태 기반)
-            long_signal = rsi_val > 50
-            short_signal = rsi_val < 50
+            # RSI > level → Long, RSI < level → Short (Pine Script: respectrsilevel)
+            level = float(params["level"])  # RSI 레벨 파라미터
+            long_signal = rsi_val > level
+            short_signal = rsi_val < level
         else:
             # RSI MA Cross: RSI > RSI_MA → Long (상태 기반)
             long_signal = rsi_val > rsi_ma
@@ -1340,9 +1438,9 @@ class RSIMADirectionConfirmation(ConfirmationIndicator):
         rsi_val = rsi_func(close, length)  # RSI 값
         rsi_ma = ma(rsi_val, ma_length, "SMA")  # RSI의 이동평균
 
-        # RSI MA 방향: 현재 > 이전 → 상승, 현재 < 이전 → 하락 (상태 기반)
-        long_signal = rsi_ma > rsi_ma.shift(1)  # RSI MA 상승 중
-        short_signal = rsi_ma < rsi_ma.shift(1)  # RSI MA 하락 중
+        # RSI MA 방향: 현재 >= 이전 → 상승, 현재 <= 이전 → 하락 (상태 기반)
+        long_signal = rsi_ma >= rsi_ma.shift(1)  # RSI MA 상승 중 (equal 포함)
+        short_signal = rsi_ma <= rsi_ma.shift(1)  # RSI MA 하락 중 (equal 포함)
 
         return IndicatorResult(
             long_signal=long_signal.fillna(False),
@@ -1367,8 +1465,8 @@ class RSILimitConfirmation(ConfirmationIndicator):
         """Pine Script 기본 파라미터."""
         return {
             "length": 14,  # RSI 기간
-            "upper": 70,  # 상한 임계값
-            "lower": 30,  # 하한 임계값
+            "upper": 40,  # 상한 임계값 (Pine Script: rsilimitup=40)
+            "lower": 60,  # 하한 임계값 (Pine Script: rsilimitdown=60)
         }
 
     def _calculate_impl(
@@ -1385,7 +1483,7 @@ class RSILimitConfirmation(ConfirmationIndicator):
             subtype: 사용하지 않음 (서브타입 없음).
 
         Returns:
-            IndicatorResult: RSI < upper → Long 허용, RSI > lower → Short 허용.
+            IndicatorResult: RSI >= upper → Long, RSI <= lower → Short.
         """
         length = int(params["length"])  # RSI 기간
         upper = float(params["upper"])  # 상한 임계값
@@ -1394,9 +1492,9 @@ class RSILimitConfirmation(ConfirmationIndicator):
 
         rsi_val = rsi_func(close, length)  # RSI 값
 
-        # 필터: RSI가 과매수 아닌 경우 Long 허용, 과매도 아닌 경우 Short 허용
-        long_signal = rsi_val < upper  # RSI가 상한 미만 → Long 허용
-        short_signal = rsi_val > lower  # RSI가 하한 초과 → Short 허용
+        # Pine Script: rsi >= rsilimitup → Long, rsi <= rsilimitdown → Short
+        long_signal = rsi_val >= upper  # RSI가 상한 이상 → Long
+        short_signal = rsi_val <= lower  # RSI가 하한 이하 → Short
 
         return IndicatorResult(
             long_signal=long_signal.fillna(False),
@@ -1422,8 +1520,8 @@ class RSIMALimitConfirmation(ConfirmationIndicator):
         return {
             "length": 14,  # RSI 기간
             "ma_length": 14,  # RSI MA 기간
-            "upper": 70,  # 상한 임계값
-            "lower": 30,  # 하한 임계값
+            "upper": 40,  # 상한 임계값 (Pine Script: rsimalimitup=40)
+            "lower": 60,  # 하한 임계값 (Pine Script: rsimalimitdown=60)
         }
 
     def _calculate_impl(
@@ -1440,7 +1538,7 @@ class RSIMALimitConfirmation(ConfirmationIndicator):
             subtype: 사용하지 않음 (서브타입 없음).
 
         Returns:
-            IndicatorResult: RSI_MA < upper → Long 허용, RSI_MA > lower → Short 허용.
+            IndicatorResult: RSI_MA >= upper → Long 허용, RSI_MA <= lower → Short 허용.
         """
         length = int(params["length"])  # RSI 기간
         ma_length = int(params["ma_length"])  # RSI MA 기간
@@ -1451,9 +1549,9 @@ class RSIMALimitConfirmation(ConfirmationIndicator):
         rsi_val = rsi_func(close, length)  # RSI 값
         rsi_ma = ma(rsi_val, ma_length, "SMA")  # RSI의 이동평균
 
-        # 필터: RSI MA가 과매수 아닌 경우 Long 허용, 과매도 아닌 경우 Short 허용
-        long_signal = rsi_ma < upper  # RSI MA가 상한 미만 → Long 허용
-        short_signal = rsi_ma > lower  # RSI MA가 하한 초과 → Short 허용
+        # Pine Script 일치: rsiMA >= rsimalimitup → Long, rsiMA <= rsimalimitdown → Short
+        long_signal = rsi_ma >= upper  # RSI MA가 상한 이상 → Long 허용
+        short_signal = rsi_ma <= lower  # RSI MA가 하한 이하 → Short 허용
 
         return IndicatorResult(
             long_signal=long_signal.fillna(False),
@@ -1544,7 +1642,12 @@ class MACDConfirmation(ConfirmationIndicator):
 class IchimokuCloudConfirmation(ConfirmationIndicator):
     """이치모쿠 클라우드 확인 지표.
 
-    종가가 구름(선행스팬A/B) 위에 있으면 Long, 아래에 있으면 Short (상태 기반).
+    Pine Script와 동일하게 5개 조건을 동시에 확인한다:
+    1. 전환선 > 기준선
+    2. 선행스팬A > 선행스팬B
+    3. close > 선행스팬A[displacement-1]
+    4. close > 선행스팬B[displacement-1]
+    5. 치코스팬 > 선행스팬A[50] AND 치코스팬 > 선행스팬B[50]
     """
 
     @property
@@ -1559,6 +1662,7 @@ class IchimokuCloudConfirmation(ConfirmationIndicator):
             "tenkan": 9,  # 전환선 기간
             "kijun": 26,  # 기준선 기간
             "senkou": 52,  # 선행스팬B 기간
+            "displacement": 26,  # 변위 (Pine Script displacement 파라미터)
         }
 
     def _calculate_impl(
@@ -1569,46 +1673,79 @@ class IchimokuCloudConfirmation(ConfirmationIndicator):
     ) -> IndicatorResult:
         """이치모쿠 클라우드 확인 시그널을 계산한다.
 
+        Pine Script 5개 조건 동시 충족 방식:
+        Long: conversionLine > baseLine AND leadLine1 > leadLine2
+              AND close > leadLine1[displacement-1]
+              AND close > leadLine2[displacement-1]
+              AND ChikouSpan > leadLine1[50]
+              AND ChikouSpan > leadLine2[50]
+        Short: 모든 조건의 반대.
+
         Args:
             df: OHLCV DataFrame.
             params: 병합된 최종 파라미터.
             subtype: 사용하지 않음.
 
         Returns:
-            IndicatorResult: close vs cloud 기반 Long/Short 상태.
+            IndicatorResult: 5개 조건 동시 충족 기반 Long/Short 시그널.
         """
         tenkan_period = int(params["tenkan"])  # 전환선 기간
         kijun_period = int(params["kijun"])  # 기준선 기간
         senkou_period = int(params["senkou"])  # 선행스팬B 기간
+        displacement = int(params["displacement"])  # 변위
         high = df["High"]  # 고가
         low = df["Low"]  # 저가
         close = df["Close"]  # 종가
 
-        # 전환선: (최고가 + 최저가) / 2 over tenkan 기간
-        tenkan_high = high.rolling(window=tenkan_period, min_periods=tenkan_period).max()
-        tenkan_low = low.rolling(window=tenkan_period, min_periods=tenkan_period).min()
-        tenkan_sen = (tenkan_high + tenkan_low) / 2.0  # 전환선
+        # donchian 함수: (최고가 + 최저가) / 2 — Pine Script의 donchian(len)
+        def donchian(length: int) -> pd.Series:
+            """donchian 중간값 계산 (Pine Script: math.avg(ta.lowest, ta.highest))."""
+            hh = high.rolling(window=length, min_periods=length).max()
+            ll = low.rolling(window=length, min_periods=length).min()
+            return (hh + ll) / 2.0
 
-        # 기준선: (최고가 + 최저가) / 2 over kijun 기간
-        kijun_high = high.rolling(window=kijun_period, min_periods=kijun_period).max()
-        kijun_low = low.rolling(window=kijun_period, min_periods=kijun_period).min()
-        kijun_sen = (kijun_high + kijun_low) / 2.0  # 기준선
+        # 전환선 (conversionLine)
+        conversion_line = donchian(tenkan_period)
+        # 기준선 (baseLine)
+        base_line = donchian(kijun_period)
+        # 선행스팬A (leadLine1): 전환선과 기준선의 평균
+        lead_line1 = (conversion_line + base_line) / 2.0
+        # 선행스팬B (leadLine2): senkou 기간 donchian
+        lead_line2 = donchian(senkou_period)
+        # 치코스팬 (ChikouSpan): Pine Script에서 close[25] + (close - close[25]) = close
+        chikou_span = close
 
-        # 선행스팬A: (전환선 + 기준선) / 2
-        senkou_a = (tenkan_sen + kijun_sen) / 2.0  # 선행스팬A
+        # --- Long 조건 (5개 동시 충족) ---
+        # 조건 1: 전환선 > 기준선
+        cond1_long = conversion_line > base_line
+        # 조건 2: 선행스팬A > 선행스팬B
+        cond2_long = lead_line1 > lead_line2
+        # 조건 3: close > 선행스팬A[displacement-1]
+        cond3_long = close > lead_line1.shift(displacement - 1)
+        # 조건 4: close > 선행스팬B[displacement-1]
+        cond4_long = close > lead_line2.shift(displacement - 1)
+        # 조건 5: 치코스팬 > 선행스팬A[50] AND 치코스팬 > 선행스팬B[50]
+        cond5_long = (chikou_span > lead_line1.shift(50)) & (
+            chikou_span > lead_line2.shift(50)
+        )
 
-        # 선행스팬B: (최고가 + 최저가) / 2 over senkou 기간
-        senkou_b_high = high.rolling(window=senkou_period, min_periods=senkou_period).max()
-        senkou_b_low = low.rolling(window=senkou_period, min_periods=senkou_period).min()
-        senkou_b = (senkou_b_high + senkou_b_low) / 2.0  # 선행스팬B
+        long_signal = cond1_long & cond2_long & cond3_long & cond4_long & cond5_long
 
-        # 구름 상단/하단
-        cloud_top = pd.concat([senkou_a, senkou_b], axis=1).max(axis=1)  # 구름 상단
-        cloud_bottom = pd.concat([senkou_a, senkou_b], axis=1).min(axis=1)  # 구름 하단
+        # --- Short 조건 (5개 동시 충족, 모든 부등호 반대) ---
+        # 조건 1: 전환선 < 기준선
+        cond1_short = conversion_line < base_line
+        # 조건 2: 선행스팬A < 선행스팬B
+        cond2_short = lead_line1 < lead_line2
+        # 조건 3: close < 선행스팬A[displacement-1]
+        cond3_short = close < lead_line1.shift(displacement - 1)
+        # 조건 4: close < 선행스팬B[displacement-1]
+        cond4_short = close < lead_line2.shift(displacement - 1)
+        # 조건 5: 치코스팬 < 선행스팬B[50] AND 치코스팬 < 선행스팬A[50]
+        cond5_short = (chikou_span < lead_line2.shift(50)) & (
+            chikou_span < lead_line1.shift(50)
+        )
 
-        # close가 구름 위 → Long, 구름 아래 → Short
-        long_signal = close > cloud_top  # 종가가 구름 위
-        short_signal = close < cloud_bottom  # 종가가 구름 아래
+        short_signal = cond1_short & cond2_short & cond3_short & cond4_short & cond5_short
 
         return IndicatorResult(
             long_signal=long_signal.fillna(False),
@@ -1616,12 +1753,15 @@ class IchimokuCloudConfirmation(ConfirmationIndicator):
         )
 
 
+
 class SuperIchiConfirmation(ConfirmationIndicator):
     """SuperIchi 확인 지표.
 
-    이치모쿠 4조건 동시 충족 시 Long/Short (상태 기반).
-    Long: close > cloud_top AND tenkan > kijun AND close > kijun AND senkou_a > senkou_b
-    Short: close < cloud_bottom AND tenkan < kijun AND close < kijun AND senkou_a < senkou_b
+    Pine Script의 ATR 기반 trailing stop avg() 함수를 사용하여
+    tenkan, kijun, senkouB를 계산하고 6개 조건 동시 충족 시 Long/Short.
+    Long: tenkan > kijun AND senkouA > senkouB AND close > senkouA[displacement-1]
+          AND close > senkouB[displacement-1] AND ChikouSpan > senkouA[50]
+          AND ChikouSpan > senkouB[50]
     """
 
     @property
@@ -1633,10 +1773,107 @@ class SuperIchiConfirmation(ConfirmationIndicator):
     def default_params(self) -> dict:
         """Pine Script 기본 파라미터."""
         return {
-            "tenkan": 9,  # 전환선 기간
-            "kijun": 26,  # 기준선 기간
-            "senkou": 52,  # 선행스팬B 기간
+            "tenkan_len": 9,  # 전환선 ATR 기간
+            "tenkan_mult": 2.0,  # 전환선 ATR 배수
+            "kijun_len": 26,  # 기준선 ATR 기간
+            "kijun_mult": 4.0,  # 기준선 ATR 배수
+            "spanB_len": 52,  # 선행스팬B ATR 기간
+            "spanB_mult": 6.0,  # 선행스팬B ATR 배수
+            "displacement": 26,  # 변위 기간
         }
+
+    @staticmethod
+    def _avg(
+        src: pd.Series,
+        hl2: pd.Series,
+        atr_values: pd.Series,
+    ) -> pd.Series:
+        """Pine Script avg(src, length, mult) 함수 구현.
+
+        ATR 기반 trailing stop을 계산하여 (max + min) / 2를 반환한다.
+        상태 기반 계산이므로 반복문으로 구현한다.
+
+        Args:
+            src: 원본 시계열 (close).
+            hl2: (high + low) / 2 시계열.
+            atr_values: ATR(length) * mult 시계열.
+
+        Returns:
+            ATR trailing stop 기반 평균값 시계열.
+        """
+        n = len(src)  # 데이터 길이
+        src_arr = src.values  # numpy 배열 변환
+        hl2_arr = hl2.values  # numpy 배열 변환
+        atr_arr = atr_values.values  # numpy 배열 변환
+
+        # 결과 배열 초기화
+        upper = np.full(n, np.nan)  # 상단 trailing stop
+        lower = np.full(n, np.nan)  # 하단 trailing stop
+        os_state = np.zeros(n, dtype=int)  # 방향 상태 (0 또는 1)
+        max_val = np.full(n, np.nan)  # 최대 추적값
+        min_val = np.full(n, np.nan)  # 최소 추적값
+        result = np.full(n, np.nan)  # 최종 결과
+
+        for i in range(n):
+            if np.isnan(atr_arr[i]) or np.isnan(hl2_arr[i]) or np.isnan(src_arr[i]):
+                continue  # ATR 미계산 구간 스킵
+
+            up = hl2_arr[i] + atr_arr[i]  # 상단 밴드
+            dn = hl2_arr[i] - atr_arr[i]  # 하단 밴드
+
+            # trailing stop 로직
+            if i == 0 or np.isnan(upper[i - 1]):
+                upper[i] = up  # 초기값
+                lower[i] = dn  # 초기값
+            else:
+                # upper: src[1] < upper[1] → min(up, upper[1]), else up
+                if src_arr[i - 1] < upper[i - 1]:
+                    upper[i] = min(up, upper[i - 1])
+                else:
+                    upper[i] = up
+                # lower: src[1] > lower[1] → max(dn, lower[1]), else dn
+                if src_arr[i - 1] > lower[i - 1]:
+                    lower[i] = max(dn, lower[i - 1])
+                else:
+                    lower[i] = dn
+
+            # 방향 상태 결정
+            if src_arr[i] > upper[i]:
+                os_state[i] = 1  # 상승 추세
+            elif src_arr[i] < lower[i]:
+                os_state[i] = 0  # 하락 추세
+            else:
+                os_state[i] = os_state[i - 1] if i > 0 else 0  # 이전 상태 유지
+
+            # 지지/저항선 선택
+            spt = lower[i] if os_state[i] == 1 else upper[i]
+
+            # cross 감지: src가 spt를 상향 또는 하향 돌파
+            is_cross = False
+            if i > 0 and not np.isnan(max_val[i - 1]):
+                prev_spt = lower[i - 1] if os_state[i - 1] == 1 else upper[i - 1]
+                if not np.isnan(prev_spt):
+                    is_cross = (src_arr[i] > spt and src_arr[i - 1] <= prev_spt) or (
+                        src_arr[i] < spt and src_arr[i - 1] >= prev_spt
+                    )
+
+            # max/min 추적
+            if i == 0 or np.isnan(max_val[i - 1]):
+                max_val[i] = src_arr[i]  # 초기값
+                min_val[i] = src_arr[i]  # 초기값
+            elif is_cross:
+                max_val[i] = max(src_arr[i], max_val[i - 1])  # 크로스 시 최대값 갱신
+                min_val[i] = min(src_arr[i], min_val[i - 1])  # 크로스 시 최소값 갱신
+            elif os_state[i] == 1:
+                max_val[i] = max(src_arr[i], max_val[i - 1])  # 상승 추세: 최대값 추적
+                min_val[i] = spt  # 하락 추세: spt로 리셋
+            else:
+                max_val[i] = spt  # 상승 추세: spt로 리셋
+                min_val[i] = min(src_arr[i], min_val[i - 1])  # 하락 추세: 최소값 추적
+
+            result[i] = (max_val[i] + min_val[i]) / 2.0  # 평균값
+
+        return pd.Series(result, index=src.index)
 
     def _calculate_impl(
         self,
@@ -1646,61 +1883,69 @@ class SuperIchiConfirmation(ConfirmationIndicator):
     ) -> IndicatorResult:
         """SuperIchi 확인 시그널을 계산한다.
 
+        Pine Script의 ATR trailing stop avg() 함수를 사용하여
+        tenkan, kijun, senkouB를 계산하고 6개 조건을 동시에 확인한다.
+
         Args:
             df: OHLCV DataFrame.
             params: 병합된 최종 파라미터.
             subtype: 사용하지 않음.
 
         Returns:
-            IndicatorResult: 4조건 동시 충족 기반 Long/Short 상태.
+            IndicatorResult: 6개 조건 동시 충족 기반 Long/Short 상태.
         """
-        tenkan_period = int(params["tenkan"])  # 전환선 기간
-        kijun_period = int(params["kijun"])  # 기준선 기간
-        senkou_period = int(params["senkou"])  # 선행스팬B 기간
+        tenkan_len = int(params["tenkan_len"])  # 전환선 ATR 기간
+        tenkan_mult = float(params["tenkan_mult"])  # 전환선 ATR 배수
+        kijun_len = int(params["kijun_len"])  # 기준선 ATR 기간
+        kijun_mult = float(params["kijun_mult"])  # 기준선 ATR 배수
+        spanB_len = int(params["spanB_len"])  # 선행스팬B ATR 기간
+        spanB_mult = float(params["spanB_mult"])  # 선행스팬B ATR 배수
+        displacement = int(params["displacement"])  # 변위 기간
+
         high = df["High"]  # 고가
         low = df["Low"]  # 저가
         close = df["Close"]  # 종가
+        hl2 = (high + low) / 2.0  # (고가 + 저가) / 2
 
-        # 전환선
-        tenkan_sen = (
-            high.rolling(window=tenkan_period, min_periods=tenkan_period).max()
-            + low.rolling(window=tenkan_period, min_periods=tenkan_period).min()
-        ) / 2.0
+        # ATR 계산 (각 기간별)
+        atr_tenkan = atr(df, tenkan_len) * tenkan_mult  # 전환선용 ATR * 배수
+        atr_kijun = atr(df, kijun_len) * kijun_mult  # 기준선용 ATR * 배수
+        atr_spanB = atr(df, spanB_len) * spanB_mult  # 선행스팬B용 ATR * 배수
 
-        # 기준선
-        kijun_sen = (
-            high.rolling(window=kijun_period, min_periods=kijun_period).max()
-            + low.rolling(window=kijun_period, min_periods=kijun_period).min()
-        ) / 2.0
+        # ATR trailing stop avg() 함수로 각 라인 계산
+        tenkan = self._avg(close, hl2, atr_tenkan)  # 전환선
+        kijun = self._avg(close, hl2, atr_kijun)  # 기준선
+        senkou_b = self._avg(close, hl2, atr_spanB)  # 선행스팬B
 
-        # 선행스팬A/B
-        senkou_a = (tenkan_sen + kijun_sen) / 2.0  # 선행스팬A
-        senkou_b = (
-            high.rolling(window=senkou_period, min_periods=senkou_period).max()
-            + low.rolling(window=senkou_period, min_periods=senkou_period).min()
-        ) / 2.0  # 선행스팬B
+        # 선행스팬A = (기준선 + 전환선) / 2
+        senkou_a = (kijun + tenkan) / 2.0
 
-        cloud_top = pd.concat([senkou_a, senkou_b], axis=1).max(axis=1)  # 구름 상단
-        cloud_bottom = pd.concat([senkou_a, senkou_b], axis=1).min(axis=1)  # 구름 하단
+        # 치코스팬 = close (Pine Script: close[25] + (close - close[25]) = close)
+        chikou_span = close
 
-        # 4조건 동시 충족
+        # 6개 조건 동시 충족
         long_signal = (
-            (close > cloud_top)  # 종가 > 구름 상단
-            & (tenkan_sen > kijun_sen)  # 전환선 > 기준선
-            & (close > kijun_sen)  # 종가 > 기준선
-            & (senkou_a > senkou_b)  # 선행스팬A > 선행스팬B
+            (tenkan > kijun)  # 조건1: 전환선 > 기준선
+            & (senkou_a > senkou_b)  # 조건2: 선행스팬A > 선행스팬B
+            & (close > senkou_a.shift(displacement - 1))  # 조건3: 종가 > 선행스팬A[displacement-1]
+            & (close > senkou_b.shift(displacement - 1))  # 조건4: 종가 > 선행스팬B[displacement-1]
+            & (chikou_span > senkou_a.shift(50))  # 조건5: 치코스팬 > 선행스팬A[50]
+            & (chikou_span > senkou_b.shift(50))  # 조건6: 치코스팬 > 선행스팬B[50]
         )
         short_signal = (
-            (close < cloud_bottom)  # 종가 < 구름 하단
-            & (tenkan_sen < kijun_sen)  # 전환선 < 기준선
-            & (close < kijun_sen)  # 종가 < 기준선
-            & (senkou_a < senkou_b)  # 선행스팬A < 선행스팬B
+            (tenkan < kijun)  # 조건1: 전환선 < 기준선
+            & (senkou_a < senkou_b)  # 조건2: 선행스팬A < 선행스팬B
+            & (close < senkou_a.shift(displacement - 1))  # 조건3: 종가 < 선행스팬A[displacement-1]
+            & (close < senkou_b.shift(displacement - 1))  # 조건4: 종가 < 선행스팬B[displacement-1]
+            & (chikou_span < senkou_b.shift(50))  # 조건5: 치코스팬 < 선행스팬B[50]
+            & (chikou_span < senkou_a.shift(50))  # 조건6: 치코스팬 < 선행스팬A[50]
         )
 
         return IndicatorResult(
             long_signal=long_signal.fillna(False),
             short_signal=short_signal.fillna(False),
         )
+
 
 
 class TrendlineBreakoutConfirmation(ConfirmationIndicator):
@@ -1967,7 +2212,7 @@ class ChandelierExitConfirmation(ConfirmationIndicator):
 class CCIConfirmation(ConfirmationIndicator):
     """CCI (Commodity Channel Index) 확인 지표.
 
-    CCI > 0 → Long, CCI < 0 → Short (상태 기반).
+    Pine Script 밴드 기반 비교: CCI > upper_band(100) → Long, CCI < lower_band(-100) → Short.
     """
 
     @property
@@ -1980,6 +2225,8 @@ class CCIConfirmation(ConfirmationIndicator):
         """Pine Script 기본 파라미터."""
         return {
             "length": 20,  # CCI 기간
+            "upper_band": 100,  # Pine Script 상한 밴드 (cciupperband)
+            "lower_band": -100,  # Pine Script 하한 밴드 (ccilowerband)
         }
 
     def _calculate_impl(
@@ -1991,6 +2238,7 @@ class CCIConfirmation(ConfirmationIndicator):
         """CCI 확인 시그널을 계산한다.
 
         CCI = (TP - SMA(TP)) / (0.015 * MAD(TP))
+        Pine Script: cci > upper_band(100) → Long, cci < lower_band(-100) → Short
 
         Args:
             df: OHLCV DataFrame.
@@ -1998,9 +2246,11 @@ class CCIConfirmation(ConfirmationIndicator):
             subtype: 사용하지 않음.
 
         Returns:
-            IndicatorResult: CCI 제로라인 기반 Long/Short 상태.
+            IndicatorResult: CCI 밴드 기반 Long/Short 상태.
         """
         length = int(params["length"])  # CCI 기간
+        upper_band = params["upper_band"]  # 상한 밴드 (Pine Script: cciupperband)
+        lower_band = params["lower_band"]  # 하한 밴드 (Pine Script: ccilowerband)
         high = df["High"]  # 고가
         low = df["Low"]  # 저가
         close = df["Close"]  # 종가
@@ -2015,8 +2265,9 @@ class CCIConfirmation(ConfirmationIndicator):
 
         cci = (tp - tp_sma) / (0.015 * mad.replace(0, np.nan))  # CCI 계산
 
-        long_signal = cci > 0  # CCI 양수 → Long
-        short_signal = cci < 0  # CCI 음수 → Short
+        # Pine Script 밴드 기반 비교: cci > 100 → Long, cci < -100 → Short
+        long_signal = cci > upper_band  # CCI가 상한 밴드 초과 → Long
+        short_signal = cci < lower_band  # CCI가 하한 밴드 미만 → Short
 
         return IndicatorResult(
             long_signal=long_signal.fillna(False),
@@ -2347,8 +2598,8 @@ class DMIADXConfirmation(ConfirmationIndicator):
     def default_params(self) -> dict:
         """Pine Script 기본 파라미터."""
         return {
-            "length": 14,  # DI 기간
-            "adx_smoothing": 14,  # ADX 평활 기간
+            "length": 10,  # DI 기간 (Pine Script dilen=10)
+            "adx_smoothing": 5,  # ADX 평활 기간 (Pine Script adxlen=5)
             "adx_threshold": 20,  # ADX 임계값
         }
 
@@ -2406,13 +2657,70 @@ class DMIADXConfirmation(ConfirmationIndicator):
             long_signal = trend_filter
             short_signal = trend_filter
         elif active_subtype == "Advance":
-            # +DI > -DI AND ADX 상승 → Long
-            long_signal = (plus_di > minus_di) & (adx > adx.shift(1))
-            short_signal = (minus_di > plus_di) & (adx > adx.shift(1))
+            # Pine Script adxcycle 상태 머신 기반 Advance 로직
+            key_level = adx_threshold  # keyLevel = adx_threshold (기본 20)
+            adx_arr = adx.values  # ADX 배열
+            diplus_arr = plus_di.values  # +DI 배열
+            diminus_arr = minus_di.values  # -DI 배열
+            n = len(adx_arr)  # 데이터 길이
+
+            long_arr = np.full(n, False)  # Long 시그널 배열
+            short_arr = np.full(n, False)  # Short 시그널 배열
+            adxcycle = 0  # adxcycle 상태 변수 (0: 초기, 1: ADX가 keyLevel 위, -1: ADX가 keyLevel 아래)
+
+            for i in range(1, n):
+                adx_cur = adx_arr[i]  # 현재 ADX
+                adx_prev = adx_arr[i - 1]  # 이전 ADX
+
+                if np.isnan(adx_cur) or np.isnan(adx_prev):
+                    continue
+
+                # adxcycle 상태 전환: crossover → 1, crossunder → -1
+                if adx_cur > key_level and adx_prev <= key_level:
+                    adxcycle = 1  # ADX가 keyLevel 상향 돌파
+                elif adx_cur < key_level and adx_prev >= key_level:
+                    adxcycle = -1  # ADX가 keyLevel 하향 돌파
+
+                dp = diplus_arr[i]  # 현재 +DI
+                dm = diminus_arr[i]  # 현재 -DI
+                if np.isnan(dp) or np.isnan(dm):
+                    continue
+
+                dp_prev = diplus_arr[i - 1]  # 이전 +DI
+                dm_prev = diminus_arr[i - 1]  # 이전 -DI
+
+                if adxcycle == -1:
+                    # ADX가 keyLevel 아래 → 진입 탐색 구간
+                    long_arr[i] = (dp > dm) and (adx_cur >= key_level) and ((dp - dm) > 1)
+                    short_arr[i] = (dm > dp) and (adx_cur >= key_level) and ((dm - dp) > 1)
+                elif adxcycle == 1:
+                    # ADX가 keyLevel 위 → 추세 진행 구간 (추가 조건 필요)
+                    base_long = (dp > dm) and (adx_cur >= key_level) and ((dp - dm) > 1)
+                    base_short = (dm > dp) and (adx_cur >= key_level) and ((dm - dp) > 1)
+
+                    if not np.isnan(dp_prev) and not np.isnan(dm_prev):
+                        extra_long = (adx_cur < 55) and (
+                            (adx_cur > adx_prev)
+                            or (dp > dp_prev and dm < dm_prev)
+                        )
+                        extra_short = (adx_cur < 55) and (
+                            (adx_cur > adx_prev)
+                            or (dm > dm_prev and dp < dp_prev)
+                        )
+                    else:
+                        extra_long = False
+                        extra_short = False
+
+                    long_arr[i] = base_long and extra_long
+                    short_arr[i] = base_short and extra_short
+
+            long_signal = pd.Series(long_arr, index=df.index)
+            short_signal = pd.Series(short_arr, index=df.index)
         else:
-            # Adx & +Di -Di: +DI > -DI AND ADX > threshold → Long
-            long_signal = (plus_di > minus_di) & (adx > adx_threshold)
-            short_signal = (minus_di > plus_di) & (adx > adx_threshold)
+            # Adx & +Di -Di: +DI > -DI AND ADX >= threshold → Long
+            # Pine Script: adxupcondition := diplus > diminus and adx>=keyLevel
+            long_signal = (plus_di > minus_di) & (adx >= adx_threshold)
+            short_signal = (minus_di > plus_di) & (adx >= adx_threshold)
 
         return IndicatorResult(
             long_signal=long_signal.fillna(False),
@@ -2451,8 +2759,11 @@ class WaddahAttarExplosionConfirmation(ConfirmationIndicator):
     ) -> IndicatorResult:
         """Waddah Attar Explosion 확인 시그널을 계산한다.
 
-        trend = MACD 차이 * sensitivity
-        explosion = BB 상단 - BB 하단
+        Pine Script 로직:
+        - deadzone = RMA(TR, 100) * 3.7
+        - trendUp = max(trend, 0), trendDown = max(-trend, 0)
+        - Long: trendUp > e1 AND e1 > deadzone AND trendUp > deadzone
+        - Short: trendDown > e1 AND e1 > deadzone AND trendDown > deadzone
 
         Args:
             df: OHLCV DataFrame.
@@ -2460,8 +2771,10 @@ class WaddahAttarExplosionConfirmation(ConfirmationIndicator):
             subtype: 사용하지 않음.
 
         Returns:
-            IndicatorResult: trend vs explosion 기반 Long/Short 상태.
+            IndicatorResult: deadzone 필터 적용된 Long/Short 상태.
         """
+        from sp500_backtest.indicators.utils import true_range
+
         sensitivity = float(params["sensitivity"])  # 감도
         fast = int(params["fast"])  # 빠른 EMA 기간
         slow = int(params["slow"])  # 느린 EMA 기간
@@ -2469,22 +2782,38 @@ class WaddahAttarExplosionConfirmation(ConfirmationIndicator):
         bb_mult = float(params["bb_mult"])  # BB 승수
         close = df["Close"]  # 종가
 
+        # deadzone 계산: RMA(TR, 100) * 3.7
+        tr = true_range(df)  # True Range
+        deadzone = ma(tr, 100, "RMA") * 3.7  # deadzone 임계값
+
         # MACD 기반 트렌드
         macd1 = ma(close, fast, "EMA") - ma(close, slow, "EMA")  # 현재 MACD
         macd2 = ma(close.shift(1), fast, "EMA") - ma(close.shift(1), slow, "EMA")  # 이전 MACD
-        trend = (macd1 - macd2) * sensitivity  # 트렌드 값
+        t1 = (macd1 - macd2) * sensitivity  # 트렌드 값
 
-        # 볼린저 밴드 기반 폭발선
+        # trendUp/trendDown 분리 (Pine Script: trendUp = t1 >= 0 ? t1 : 0)
+        trend_up = t1.clip(lower=0)  # 상승 트렌드 (음수는 0)
+        trend_down = (-t1).clip(lower=0)  # 하락 트렌드 (양수는 0)
+
+        # 볼린저 밴드 기반 폭발선 (e1)
         bb_sma = ma(close, bb_length, "SMA")  # BB 중심선
         bb_std = close.rolling(window=bb_length, min_periods=bb_length).std()  # BB 표준편차
-        bb_upper = bb_sma + bb_mult * bb_std  # BB 상단
-        bb_lower = bb_sma - bb_mult * bb_std  # BB 하단
-        explosion = bb_upper - bb_lower  # 폭발선
+        e1 = (bb_sma + bb_mult * bb_std) - (bb_sma - bb_mult * bb_std)  # 폭발선
 
-        # trend > 0 AND trend > explosion → Long
-        long_signal = (trend > 0) & (trend > explosion)
-        # trend < 0 AND |trend| > explosion → Short
-        short_signal = (trend < 0) & (trend.abs() > explosion)
+        # Pine Script: trendUp > e1 AND e1 > deadzone AND trendUp > deadzone → Long
+        long_signal = (
+            (trend_up > 0)
+            & (trend_up > e1)
+            & (e1 > deadzone)
+            & (trend_up > deadzone)
+        )
+        # Pine Script: trendDown > e1 AND e1 > deadzone AND trendDown > deadzone → Short
+        short_signal = (
+            (trend_down > 0)
+            & (trend_down > e1)
+            & (e1 > deadzone)
+            & (trend_down > deadzone)
+        )
 
         return IndicatorResult(
             long_signal=long_signal.fillna(False),
@@ -2547,10 +2876,11 @@ class VolatilityOscillatorConfirmation(ConfirmationIndicator):
         )
 
 
+
 class ChoppinessIndexConfirmation(ConfirmationIndicator):
     """Choppiness Index 확인 지표.
 
-    CI < 38.2 → 추세 존재 (Long+Short 허용), CI > 61.8 → 횡보 (둘 다 불허).
+    CI < ci_limit → 추세 존재 (Long), CI >= ci_limit → 횡보 (Short).
     확인 전용 필터 지표.
     """
 
@@ -2564,8 +2894,7 @@ class ChoppinessIndexConfirmation(ConfirmationIndicator):
         """Pine Script 기본 파라미터."""
         return {
             "length": 14,  # CI 기간
-            "trending_threshold": 38.2,  # 추세 임계값
-            "choppy_threshold": 61.8,  # 횡보 임계값
+            "ci_limit": 61.8,  # CI 임계값
         }
 
     def _calculate_impl(
@@ -2587,7 +2916,7 @@ class ChoppinessIndexConfirmation(ConfirmationIndicator):
             IndicatorResult: CI 기반 추세/횡보 필터.
         """
         length = int(params["length"])  # CI 기간
-        trending = float(params["trending_threshold"])  # 추세 임계값
+        ci_limit = float(params["ci_limit"])  # CI 임계값
         high = df["High"]  # 고가
         low = df["Low"]  # 저가
 
@@ -2600,15 +2929,17 @@ class ChoppinessIndexConfirmation(ConfirmationIndicator):
 
         ci = 100.0 * np.log10(atr_sum / hl_range) / np.log10(length)  # CI 계산
 
-        # CI < trending → 추세 존재 (Long AND Short 모두 허용)
-        trending_filter = ci < trending  # 추세 필터
-        long_signal = trending_filter
-        short_signal = trending_filter
+        # Pine Script: ci_filter는 long/short 모두 동일 (ci < ci_limit → 추세 존재)
+        # pushConfirmation(respectci, "Choppiness Index", ci_filter, ci_filter)
+        ci_filter = ci < ci_limit  # 추세 필터 (CI가 임계값 미만이면 추세 존재)
+        long_signal = ci_filter  # 추세 존재 시 Long 허용
+        short_signal = ci_filter  # 추세 존재 시 Short 허용
 
         return IndicatorResult(
             long_signal=long_signal.fillna(False),
             short_signal=short_signal.fillna(False),
         )
+
 
 
 class DamianiVolatilityConfirmation(ConfirmationIndicator):

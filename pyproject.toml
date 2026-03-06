@@ -21,3 +21,8 @@ dev = [
 [tool.pytest.ini_options]
 testpaths = ["sp500_backtest/tests"]
 pythonpath = ["."]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+]

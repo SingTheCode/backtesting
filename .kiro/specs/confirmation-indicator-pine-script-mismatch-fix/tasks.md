@@ -1,0 +1,201 @@
+# Implementation Plan
+
+- [x] 1. 버그 조건 탐색 테스트 작성 (수정 전 코드에서 실행)
+  - **Property 1: Fault Condition** - 14개 Confirmation Indicator Pine Script 불일치 재현
+  - **CRITICAL**: 이 property-based 테스트는 수정 전 코드에서 반드시 FAIL해야 함 — 실패가 버그 존재를 확인함
+  - **DO NOT attempt to fix the test or the code when it fails**
+  - **NOTE**: 이 테스트는 기대 동작을 인코딩함 — 수정 후 PASS하면 버그가 해결된 것
+  - **GOAL**: 14개 indicator의 버그를 재현하는 counterexample을 발견
+  - **Scoped PBT Approach**: 각 indicator별 구체적인 버그 조건에 대해 property를 작성
+  - 테스트 파일: `sp500_backtest/tests/test_confirmation_fault_condition.py`
+  - 합성 OHLCV DataFrame을 생성하여 각 indicator의 버그를 재현
+  - **테스트 케이스 (isBugCondition에서 도출)**:
+    - RSILimitConfirmation: 기본 파라미터에서 `upper`가 40이고 `lower`가 60인지 확인, `rsi >= upper` → Long 로직 확인
+    - RSIMALimitConfirmation: 기본 파라미터에서 `upper`가 40이고 `lower`가 60인지 확인, `rsi_ma >= upper` → Long 로직 확인
+    - BullBearPowerTrendConfirmation: `(close - lowest(low, 50)) / ATR(5)` 공식 사용 확인
+    - CCIConfirmation: `cci > 100` → Long, `cci < -100` → Short 밴드 기반 비교 확인
+    - IchimokuCloudConfirmation: 5개 조건 동시 충족 확인 (전환선>기준선, 선행스팬A>B, close>선행스팬[displacement-1], 치코스팬>선행스팬[50])
+    - SuperIchiConfirmation: ATR 기반 trailing stop `avg()` 함수와 `tenkan_mult=2, kijun_mult=4, spanB_mult=6` 파라미터 확인
+    - TSIConfirmation (Zero line cross): `tsi > signal AND tsi > 0` 두 조건 동시 확인
+    - BXtrenderConfirmation: RSI + T3 이동평균 기반 계산과 방향 비교(`> [1]`) 확인, `long_l1=5, long_l2=10` 파라미터 확인
+    - WaddahAttarExplosionConfirmation: deadzone(`RMA(TR, 100) * 3.7`) 필터 적용 확인
+    - DonchianTrendRibbonConfirmation: `close > highest[1]` → trend=1 브레이크아웃 로직 확인
+    - DMIADXConfirmation: `length=10, adx_smoothing=5` 기본값 확인, Advance 서브타입 adxcycle 및 DI 차이 > 1 조건 확인
+    - ChoppinessIndexConfirmation: 단일 `ci_limit=61.8` 파라미터로 `ci < ci_limit` 조건 확인
+    - RSIMADirectionConfirmation: `>=` 비교 연산자 확인 (strict `>` 대신)
+    - RSIConfirmation (RSI Level): `level` 파라미터(기본값 50) 사용 확인
+  - 수정 전 코드에서 실행 — **EXPECTED OUTCOME**: 테스트 FAIL (버그 존재 확인)
+  - counterexample 문서화하여 근본 원인 이해
+  - 테스트가 작성되고, 실행되고, 실패가 문서화되면 태스크 완료 처리
+  - _Requirements: 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9, 1.10, 1.11, 1.12, 1.13, 1.14_
+
+- [x] 2. 보존 property 테스트 작성 (수정 전 코드에서 실행)
+  - **Property 2: Preservation** - 비수정 Indicator 및 비수정 서브타입 동작 보존
+  - **IMPORTANT**: observation-first 방법론을 따를 것
+  - 테스트 파일: `sp500_backtest/tests/test_confirmation_preservation.py`
+  - **Observation-first 방법론**:
+    - 수정 전 코드에서 비수정 indicator들의 실제 출력을 관찰
+    - 관찰된 출력을 기반으로 property-based 테스트 작성
+    - 수정 전 코드에서 테스트가 PASS하는지 확인
+  - **보존 대상 (isBugCondition이 false인 케이스)**:
+    - 비수정 indicator 30개+: EMAFilter, TwoEMACross, ThreeEMACross, RangeFilter, RQK, Supertrend, HalfTrend, ROC, McGinleyDynamic, DPO, BBOscillator, Stochastic, MACD, TrendlineBreakout, RangeDetector, HACOLT, ChandelierExit, ParabolicSAR, SSLChannel, HullSuite, AwesomeOscillator, VolatilityOscillator, DamianiVolatility, Volume, WolfpackId, QQEMod, ChaikinMoneyFlow, VortexIndicator, STC, VWAP
+    - RSIConfirmation의 "RSI MA Cross", "RSI Exits OB-OS" 서브타입
+    - TSIConfirmation의 "Signal Cross" 서브타입
+    - DMIADXConfirmation의 "Adx Only", "Adx & +Di -Di" 서브타입 (기본값 변경 외 동일 로직)
+  - **Property-based 테스트 전략**:
+    - 합성 OHLCV DataFrame 생성 (hypothesis 라이브러리 사용)
+    - 수정 전 코드의 출력을 snapshot으로 저장
+    - 수정 후 코드의 출력이 snapshot과 동일한지 검증
+    - 모든 결과가 `IndicatorResult(long_signal, short_signal)` 형식인지 검증
+    - NaN이 False로 채워지는지 검증
+    - `_resolve_params` 메서드를 통한 사용자 파라미터 병합 동작 유지 검증
+    - 유효하지 않은 서브타입 전달 시 `ValueError` 발생 검증
+  - 수정 전 코드에서 실행 — **EXPECTED OUTCOME**: 테스트 PASS (기존 동작 확인)
+  - 테스트가 작성되고, 실행되고, 수정 전 코드에서 통과하면 태스크 완료 처리
+  - _Requirements: 3.1, 3.2, 3.3, 3.4, 3.5, 3.6, 3.7_
+
+- [x] 3. 14개 Confirmation Indicator Pine Script 불일치 수정
+  - [x] 3.1 RSILimitConfirmation 기본값 및 로직 수정 (CRITICAL)
+    - `default_params`: `upper=70` → `upper=40`, `lower=30` → `lower=60`
+    - `_calculate_impl`: `rsi_val < upper` → `rsi_val >= upper`, `rsi_val > lower` → `rsi_val <= lower`
+    - _Bug_Condition: isBugCondition("RSILimitConfirmation") — 기본값 70/30 사용 및 `<`/`>` 비교 연산자_
+    - _Expected_Behavior: `upper=40, lower=60`, `rsi >= upper` → Long, `rsi <= lower` → Short_
+    - _Preservation: 클래스 구조, 상속 관계, name/subtypes 프로퍼티 유지_
+    - _Requirements: 2.1_
+
+  - [x] 3.2 RSIMALimitConfirmation 기본값 및 로직 수정 (CRITICAL)
+    - `default_params`: `upper=70` → `upper=40`, `lower=30` → `lower=60`
+    - `_calculate_impl`: `rsi_ma < upper` → `rsi_ma >= upper`, `rsi_ma > lower` → `rsi_ma <= lower`
+    - _Bug_Condition: isBugCondition("RSIMALimitConfirmation") — 기본값 70/30 사용 및 `<`/`>` 비교 연산자_
+    - _Expected_Behavior: `upper=40, lower=60`, `rsi_ma >= upper` → Long, `rsi_ma <= lower` → Short_
+    - _Preservation: 클래스 구조, 상속 관계, name/subtypes 프로퍼티 유지_
+    - _Requirements: 2.2_
+
+  - [x] 3.3 BullBearPowerTrendConfirmation 공식 전체 재작성 (CRITICAL)
+    - `_calculate_impl` 전체 재작성: `BullTrend = (close - lowest(low, 50)) / ATR(5)`, `BearTrend = (highest(high, 50) - close) / ATR(5)`
+    - `BearTrend2 = -1 * BearTrend`, `Trend = BullTrend - BearTrend`
+    - 히스토그램: `BullTrend < 2` → `BullTrend_hist = BullTrend - 2`, `BearTrend2 > -2` → `BearTrend_hist = BearTrend2 + 2`
+    - Follow Trend: `BearTrend_hist > 0 AND Trend >= 2` → Long
+    - Without Trend: `BearTrend_hist > 0` → Long
+    - _Bug_Condition: isBugCondition("BullBearPowerTrendConfirmation") — Elder 공식 사용 (Pine Script는 커스텀 정규화 공식)_
+    - _Expected_Behavior: Pine Script와 동일한 BullTrend/BearTrend 정규화 공식 + 히스토그램 로직_
+    - _Preservation: 클래스 구조, 서브타입 이름 유지_
+    - _Requirements: 2.3_
+
+  - [x] 3.4 CCIConfirmation 밴드 기반 비교 수정 (MAJOR)
+    - `default_params`에 `upper_band=100`, `lower_band=-100` 추가
+    - `_calculate_impl`: `cci > 0` → `cci > upper_band`, `cci < 0` → `cci < lower_band`
+    - _Bug_Condition: isBugCondition("CCIConfirmation") — 제로라인 기준 비교 (Pine Script는 밴드 기준)_
+    - _Expected_Behavior: `cci > 100` → Long, `cci < -100` → Short_
+    - _Preservation: 클래스 구조 유지_
+    - _Requirements: 2.4_
+
+  - [x] 3.5 IchimokuCloudConfirmation 5개 조건 수정 (MAJOR)
+    - `default_params`에 `displacement=26` 추가
+    - `_calculate_impl` 전체 재작성: 5개 조건 동시 충족
+    - `conversionLine > baseLine AND leadLine1 > leadLine2 AND close > leadLine1.shift(displacement-1) AND close > leadLine2.shift(displacement-1) AND ChikouSpan > leadLine1.shift(50) AND ChikouSpan > leadLine2.shift(50)`
+    - `ChikouSpan = close`
+    - _Bug_Condition: isBugCondition("IchimokuCloudConfirmation") — 단일 조건만 확인 (Pine Script는 5개 조건)_
+    - _Expected_Behavior: 5개 조건 동시 충족 시에만 Long 시그널_
+    - _Preservation: 클래스 구조, donchian 계산 함수 유지_
+    - _Requirements: 2.5_
+
+  - [x] 3.6 SuperIchiConfirmation ATR 기반 계산 전체 재작성 (MAJOR)
+    - `default_params` 전체 재작성: `tenkan_len=9, tenkan_mult=2.0, kijun_len=26, kijun_mult=4.0, spanB_len=52, spanB_mult=6.0, displacement=26`
+    - ATR 기반 trailing stop `avg()` 함수 구현
+    - 6개 조건 동시 충족: `tenkan > kijun AND senkouA > senkouB AND close > senkouA[displacement-1] AND close > senkouB[displacement-1] AND ChikouSpan > senkouA[50] AND ChikouSpan > senkouB[50]`
+    - _Bug_Condition: isBugCondition("SuperIchiConfirmation") — 표준 donchian 계산 (Pine Script는 ATR 기반 커스텀 계산)_
+    - _Expected_Behavior: ATR trailing stop avg() + multiplier 파라미터 기반 계산_
+    - _Preservation: 클래스 구조 유지_
+    - _Requirements: 2.6_
+
+  - [x] 3.7 TSIConfirmation Zero line cross 수정 (MAJOR)
+    - `_calculate_impl`의 "Zero line cross" 분기: `tsi > 0` → `(tsi > signal_line) & (tsi > 0)`, `tsi < 0` → `(tsi < signal_line) & (tsi < 0)`
+    - _Bug_Condition: isBugCondition("TSIConfirmation", subtype="Zero line cross") — 단일 조건만 확인_
+    - _Expected_Behavior: `tsi > signal AND tsi > 0` 두 조건 동시 충족_
+    - _Preservation: "Signal Cross" 서브타입 로직 유지_
+    - _Requirements: 2.7_
+
+  - [x] 3.8 BXtrenderConfirmation RSI+T3 기반 계산 전체 재작성 (MAJOR)
+    - `default_params`에 `long_l1=5, long_l2=10` 추가
+    - `_calculate_impl` 전체 재작성: `shortTermXtrender = rsi(ema(close, short_l1) - ema(close, short_l2), short_l3) - 50`
+    - T3 이동평균 구현: `maShortTermXtrender = t3(shortTermXtrender, 5)`
+    - Short Term trend: `maShortTermXtrender > maShortTermXtrender[1]` → Long
+    - Short and Long term trend: 위 조건 + `longTermXtrender > 0 AND longTermXtrender > longTermXtrender[1] AND shortTermXtrender > shortTermXtrender[1] AND shortTermXtrender > 0`
+    - `subtypes` 이름 변경: `"Short term"` → `"Short Term trend"`, `"Short and Long term"` → `"Short and Long term trend"`
+    - _Bug_Condition: isBugCondition("BXtrenderConfirmation") — stoch+SMA 기반 계산 및 레벨 비교_
+    - _Expected_Behavior: RSI+T3 기반 계산 및 방향 비교(`> [1]`)_
+    - _Preservation: 클래스 구조 유지_
+    - _Requirements: 2.8_
+
+  - [x] 3.9 WaddahAttarExplosionConfirmation deadzone 추가 (MAJOR)
+    - `_calculate_impl`에 deadzone 계산 추가: `deadzone = RMA(TR, 100) * 3.7`
+    - `trendUp = max(trend, 0)`, `trendDown = max(-trend, 0)` 분리
+    - Long: `trendUp > 0 AND trendUp > e1 AND e1 > deadzone AND trendUp > deadzone`
+    - Short: `trendDown > 0 AND trendDown > e1 AND e1 > deadzone AND trendDown > deadzone`
+    - _Bug_Condition: isBugCondition("WaddahAttarExplosionConfirmation") — deadzone 필터 누락_
+    - _Expected_Behavior: deadzone(`RMA(TR, 100) * 3.7`) 필터 필수 적용_
+    - _Preservation: MACD/BB 계산 로직 유지_
+    - _Requirements: 2.9_
+
+  - [x] 3.10 DonchianTrendRibbonConfirmation 브레이크아웃 로직 전체 재작성 (MAJOR)
+    - `_calculate_impl` 전체 재작성: `hh = highest(high, period)`, `ll = lowest(low, period)`
+    - `trend = 1 if close > hh[1] else (-1 if close < ll[1] else trend[t-1])`
+    - 상태 기반 루프로 구현 (이전 trend 값 유지)
+    - _Bug_Condition: isBugCondition("DonchianTrendRibbonConfirmation") — 5개 기간 중간값 합산 방식_
+    - _Expected_Behavior: 단일 dchannel 브레이크아웃 기반 로직_
+    - _Preservation: 클래스 구조 유지_
+    - _Requirements: 2.10_
+
+  - [x] 3.11 DMIADXConfirmation 기본값 및 Advance 서브타입 수정 (MODERATE)
+    - `default_params`: `length=14` → `length=10`, `adx_smoothing=14` → `adx_smoothing=5`
+    - Advance 서브타입 전체 재작성: `adxcycle` 상태 변수 추가
+    - `adxcycle == -1`: `diplus > diminus AND adx >= keyLevel AND diplus - diminus > 1`
+    - `adxcycle == 1`: 위 조건 + `adx < 55 AND (adx > adx[1] OR (diplus > diplus[1] AND diminus < diminus[1]))`
+    - _Bug_Condition: isBugCondition("DMIADXConfirmation") — 기본값 14/14 및 Advance 로직 누락_
+    - _Expected_Behavior: 기본값 10/5, adxcycle 상태 머신 + DI 차이 > 1 조건_
+    - _Preservation: "Adx Only", "Adx & +Di -Di" 서브타입 로직 유지 (기본값 변경 외)_
+    - _Requirements: 2.11_
+
+  - [x] 3.12 ChoppinessIndexConfirmation 단일 임계값 수정 (MODERATE)
+    - `default_params`: `trending_threshold=38.2, choppy_threshold=61.8` → `ci_limit=61.8`
+    - `_calculate_impl`: `ci < trending` → `ci < ci_limit`
+    - _Bug_Condition: isBugCondition("ChoppinessIndexConfirmation") — 이중 임계값 사용_
+    - _Expected_Behavior: 단일 `ci_limit=61.8` 파라미터로 `ci < ci_limit` 조건_
+    - _Preservation: 클래스 구조 유지_
+    - _Requirements: 2.12_
+
+  - [x] 3.13 RSIMADirectionConfirmation 비교 연산자 수정 (MODERATE)
+    - `_calculate_impl`: `rsi_ma > rsi_ma.shift(1)` → `rsi_ma >= rsi_ma.shift(1)`, `rsi_ma < rsi_ma.shift(1)` → `rsi_ma <= rsi_ma.shift(1)`
+    - _Bug_Condition: isBugCondition("RSIMADirectionConfirmation") — strict `>` 비교 사용_
+    - _Expected_Behavior: `>=`/`<=` 비교 (equal 포함)_
+    - _Preservation: 클래스 구조 유지_
+    - _Requirements: 2.13_
+
+  - [x] 3.14 RSIConfirmation RSI Level 파라미터화 (MINOR)
+    - `default_params`에 `level=50` 추가
+    - `_calculate_impl`의 "RSI Level" 분기: 하드코딩 `50` → `params["level"]` 사용
+    - _Bug_Condition: isBugCondition("RSIConfirmation", subtype="RSI Level") — 레벨 50 하드코딩_
+    - _Expected_Behavior: `level` 파라미터(기본값 50)로 설정 가능_
+    - _Preservation: "RSI MA Cross", "RSI Exits OB-OS" 서브타입 로직 유지_
+    - _Requirements: 2.14_
+
+  - [x] 3.15 버그 조건 탐색 테스트가 이제 통과하는지 확인
+    - **Property 1: Expected Behavior** - 14개 Indicator 수정 후 Pine Script 일치 확인
+    - **IMPORTANT**: 태스크 1에서 작성한 동일한 테스트를 재실행 — 새 테스트를 작성하지 말 것
+    - 태스크 1의 테스트가 기대 동작을 인코딩하고 있음
+    - 이 테스트가 통과하면 기대 동작이 충족된 것
+    - `uv run pytest sp500_backtest/tests/test_confirmation_fault_condition.py` 실행
+    - **EXPECTED OUTCOME**: 테스트 PASS (버그 수정 확인)
+    - _Requirements: 2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 2.7, 2.8, 2.9, 2.10, 2.11, 2.12, 2.13, 2.14_
+
+  - [x] 3.16 보존 테스트가 여전히 통과하는지 확인
+    - **Property 2: Preservation** - 비수정 Indicator 동작 보존 확인
+    - **IMPORTANT**: 태스크 2에서 작성한 동일한 테스트를 재실행 — 새 테스트를 작성하지 말 것
+    - `uv run pytest sp500_backtest/tests/test_confirmation_preservation.py` 실행
+    - **EXPECTED OUTCOME**: 테스트 PASS (회귀 없음 확인)
+    - 수정 후 모든 테스트가 여전히 통과하는지 확인 (회귀 없음)
+
+- [x] 4. 체크포인트 - 모든 테스트 통과 확인
+  - `uv run pytest sp500_backtest/tests/` 실행하여 전체 테스트 스위트 통과 확인
+  - 질문이 있으면 사용자에게 확인

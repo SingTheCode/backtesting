@@ -6,12 +6,13 @@ data:
 # 조합 설정
 combination:
   max_confirmations: 3
-  max_combinations: 100000
+  max_combinations: 800000
 
 # 백테스팅 설정
 backtest:
   transaction_cost: 0.001
   signal_expiry: 3
+  signal_expiry_values: [2, 3, 5]
   alternate_signal: true
 
 # 파라미터 최적화 설정

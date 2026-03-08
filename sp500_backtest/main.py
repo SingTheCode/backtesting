@@ -138,7 +138,12 @@ def _run_combination_backtest(
         BacktestResult 리스트 (최적화 시 여러 개, 단일 백테스팅 시 0~1개).
     """
     backtest_cfg = config.get("backtest", {})
-    signal_expiry = backtest_cfg.get("signal_expiry", 3)  # 시그널 만료 캔들 수
+    # 조합에 signal_expiry가 지정되어 있으면 우선 사용, 없으면 config 기본값
+    signal_expiry = (
+        combination.signal_expiry
+        if combination.signal_expiry is not None
+        else backtest_cfg.get("signal_expiry", 3)
+    )  # 시그널 만료 캔들 수
     alternate_signal = backtest_cfg.get("alternate_signal", True)  # 연속 동일 방향 필터링
     transaction_cost = backtest_cfg.get("transaction_cost", 0.001)  # 거래 비용 비율
 
@@ -227,6 +232,7 @@ def run_pipeline(config: dict[str, Any] | None = None) -> list[BacktestResult]:
 
     # ── 4. 조합 생성 ──
     combo_cfg = config.get("combination", {})
+    backtest_cfg = config.get("backtest", {})
     engine = CombinationEngine(
         leading_names=leading_names,
         confirmation_info=confirmation_info,
@@ -234,6 +240,7 @@ def run_pipeline(config: dict[str, Any] | None = None) -> list[BacktestResult]:
     combinations = engine.generate(
         max_confirmations=combo_cfg.get("max_confirmations", 3),
         max_combinations=combo_cfg.get("max_combinations", 100_000),
+        signal_expiry_values=backtest_cfg.get("signal_expiry_values"),
     )
 
     # ── 5. 체크포인트 복원 ──
